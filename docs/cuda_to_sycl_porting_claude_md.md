@@ -75,11 +75,16 @@ Submit to PyTorch upstream via torch-xpu-ops (kernel) and pytorch (dispatch):
 1. **Add kernel files**:
    - Regular SYCL: `src/ATen/native/xpu/sycl/YourKernel.cpp` + `.h`
    - sycl-tla: `src/ATen/native/xpu/sycltla/YourKernel.cpp` + `.h`
-2. **Update CMake** in `src/ATen/CMakeLists.txt`:
+2. **Add USE_SYCLTLA-guarded wrapper** (CRITICAL for CI — see Pitfalls):
+   - `src/ATen/native/xpu/YourKernel.h` — public header with `is_*_available()` + wrapper declaration
+   - `src/ATen/native/xpu/YourKernel.cpp` — wrapper that `#ifdef USE_SYCLTLA` calls the real kernel, else `TORCH_CHECK(false, ...)`
+   - This compiles into `torch_xpu_ops` (always built), NOT the sycltla shared library
+   - Follow the Flash Attention pattern: `src/ATen/native/transformers/xpu/flash_attn/flash_api.cpp`
+3. **Update CMake** in `src/ATen/CMakeLists.txt`:
    - Add source glob pattern (e.g., `"native/xpu/sycltla/*.cpp"`)
    - Add `install_xpu_headers("native/xpu/sycltla")` if new directory
-3. **Add unit tests** to `test/xpu/test_yourkernel_xpu.py`
-4. **Commit and note the commit hash**
+4. **Add unit tests** to `test/xpu/test_yourkernel_xpu.py`
+5. **Commit and note the commit hash**
 
 #### PyTorch PR (commit SECOND)
 
@@ -89,8 +94,9 @@ Submit to PyTorch upstream via torch-xpu-ops (kernel) and pytorch (dispatch):
    ```
 2. **Add dispatch function** in `aten/src/ATen/native/mkldnn/xpu/YourBlas.cpp`:
    - Include `<ATen/native/YourUtils.h>` for validation helpers
-   - Include `<ATen/native/xpu/sycltla/YourKernel.h>` for kernel declaration
-   - Route to fast-path kernel for supported dtypes, fallback otherwise
+   - Include `<ATen/native/xpu/YourKernel.h>` for the **wrapper** header (NOT sycltla header)
+   - Check `is_*_available()` before taking fast path
+   - Route to fast-path wrapper for supported dtypes, fallback otherwise
 3. **Update `third_party/xpu.txt`** with the torch-xpu-ops commit hash from step above
 4. **Commit**
 
@@ -155,8 +161,29 @@ if __name__ == "__main__":
 - **Replace CUDA skip guards**: Remove `SM80OrLater`, `SM90OrLater` etc. Use `@onlyXPU` instead.
 - **Run tests from `/tmp`**: Running from inside the pytorch source tree causes `torch/_C` import conflicts. Always `cd /tmp` before running test scripts.
 
-### Build
+### Build and CI
 
+- **USE_SYCLTLA wrapper is mandatory for sycl-tla kernels**: The PyTorch dispatch function in `aten/src/ATen/native/mkldnn/xpu/` must NEVER directly call sycltla symbols (e.g., `at::xpu::detail::bf16bf16_grouped_mm`). sycltla kernels are built as separate shared libraries only when `USE_SYCLTLA=ON`. On CI or builds without sycltla, direct calls cause undefined symbol link errors. Instead, create a wrapper in torch-xpu-ops regular sources (`native/xpu/YourKernel.cpp`) guarded by `#ifdef USE_SYCLTLA`, and have PyTorch call the wrapper. Pattern:
+  ```cpp
+  // torch-xpu-ops/src/ATen/native/xpu/YourKernel.cpp (always compiled)
+  #ifdef USE_SYCLTLA
+  #include <ATen/native/xpu/sycltla/YourKernel.h>
+  #endif
+  bool is_your_kernel_available() {
+  #ifdef USE_SYCLTLA
+    return true;
+  #else
+    return false;
+  #endif
+  }
+  void your_kernel(...) {
+  #ifdef USE_SYCLTLA
+    at::xpu::detail::your_kernel(...);  // forward to sycltla
+  #else
+    TORCH_CHECK(false, "Not compiled with SYCLTLA support.");
+  #endif
+  }
+  ```
 - **Stale installed headers**: After updating torch-xpu-ops, headers in `pytorch/torch/include/ATen/native/xpu/sycl/` may be stale from a previous build. If you see template signature mismatches, copy the updated header from `third_party/torch-xpu-ops/src/` to `torch/include/`.
 - **Commit order matters**: Always commit torch-xpu-ops first, get the commit hash, update `pytorch/third_party/xpu.txt`, then commit PyTorch. The build system fetches torch-xpu-ops by this hash.
 - **sycl-tla SPIR-V flags for local builds**: When building a standalone extension with `setup.py`, monkey-patch the SYCL link flags:
